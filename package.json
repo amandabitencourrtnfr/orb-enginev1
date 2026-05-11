@@ -1,0 +1,27 @@
+{
+  "name": "the-orb-engine",
+  "version": "0.2.0",
+  "description": "Motor astrológico standalone para o app THE ORB",
+  "type": "module",
+  "main": "src/chart.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/test-all-charts.js && node test/validate-synastry.js && node test/validate-synastry-brn.js && node test/validate-transits-amanda.js && node test/validate-transits-bruna.js",
+    "test:natal": "node test/test-all-charts.js",
+    "test:synastry": "node test/validate-synastry.js && node test/validate-synastry-brn.js",
+    "test:transits": "node test/validate-transits-amanda.js && node test/validate-transits-bruna.js"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "exports": {
+    "./chart": "./src/chart.js",
+    "./synastry": "./src/synastry.js",
+    "./astronomy": "./src/astronomy.js",
+    "./houses": "./src/houses.js",
+    "./aspects": "./src/aspects.js",
+    "./timezone": "./src/timezone.js",
+    "./client": "./src/client.js"
+  }
+}
