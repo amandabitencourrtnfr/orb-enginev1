@@ -1,161 +1,131 @@
 // ============================================================================
-// THE ORB ENGINE — timezone.js
+// THE ORB ENGINE — timezone.js (v0.3)
 // ----------------------------------------------------------------------------
-// Resolução de offset de timezone histórico, incluindo horário de verão.
+// Resolução de timezone via Luxon + IANA tz database + geo-tz para lookup
+// geográfico por lat/lon.
 //
-// Implementação minimalista que cobre:
-//   - Brasil (com regras de horário de verão 1985-2019)
-//   - Argentina, Uruguai (sem DST atual)
-//   - Países sem DST: maior parte do mundo
-//   - Estados Unidos (DST padrão US)
-//   - Europa (DST padrão UE)
+// Cobertura GLOBAL: todos os países, todas as mudanças históricas de DST
+// (incluindo: Brasil 1985-2019 com regras regionais, EUA por estado,
+// Europa, Ásia, Oceania, casos exóticos tipo Samoa pulando um dia, etc).
 //
-// Para deploy em produção com cobertura global completa, substituir esta
-// implementação por `luxon` + base IANA (tz database), que cobre TODOS os
-// países e mudanças históricas exatas.
+// API:
+//   resolveTimezoneOffset(year, month, day, hour, minute, latitude, longitude)
+//     → retorna { offsetHours, ianaName, isDST } no momento exato
+//
+//   localToUT(year, month, day, hour, minute, latitude, longitude)
+//     → converte data/hora local pra UT respeitando o timezone do local
 // ============================================================================
 
-// Regras de horário de verão do Brasil (DST = Daylight Saving Time)
-// Histórico: DST começava em outubro/novembro e terminava em fevereiro/março
-// Estados Sul/Sudeste/Centro-Oeste participavam; Norte/Nordeste nunca.
-// O DST foi extinto em 2019 pelo decreto 9.772/2019.
-//
-// Cada entrada: { start: "YYYY-MM-DD", end: "YYYY-MM-DD" } (ambos UTC)
-// Durante esses intervalos, offset = -2 em vez de -3 (BRT → BRST)
-const BRAZIL_DST = [
-  // Período 1985-1986 (início do DST moderno)
-  { start: "1985-11-02", end: "1986-03-15" },
-  { start: "1986-10-25", end: "1987-02-14" },
-  { start: "1987-10-25", end: "1988-02-07" },
-  { start: "1988-10-16", end: "1989-01-29" },
-  { start: "1989-10-15", end: "1990-02-11" },
-  { start: "1990-10-21", end: "1991-02-17" },
-  { start: "1991-10-20", end: "1992-02-09" },
-  { start: "1992-10-25", end: "1993-01-31" },
-  { start: "1993-10-17", end: "1994-02-20" },
-  { start: "1994-10-16", end: "1995-02-19" },
-  { start: "1995-10-15", end: "1996-02-11" },
-  { start: "1996-10-06", end: "1997-02-16" },
-  { start: "1997-10-06", end: "1998-03-01" },
-  { start: "1998-10-11", end: "1999-02-21" },
-  { start: "1999-10-03", end: "2000-02-27" },
-  { start: "2000-10-08", end: "2001-02-18" },
-  { start: "2001-10-14", end: "2002-02-17" },
-  { start: "2002-11-03", end: "2003-02-16" },
-  { start: "2003-10-19", end: "2004-02-15" },
-  { start: "2004-11-02", end: "2005-02-20" },
-  { start: "2005-10-16", end: "2006-02-19" },
-  { start: "2006-11-05", end: "2007-02-25" },
-  { start: "2007-10-14", end: "2008-02-17" },
-  { start: "2008-10-19", end: "2009-02-15" },
-  { start: "2009-10-18", end: "2010-02-21" },
-  { start: "2010-10-17", end: "2011-02-20" },
-  { start: "2011-10-16", end: "2012-02-26" },
-  { start: "2012-10-21", end: "2013-02-17" },
-  { start: "2013-10-20", end: "2014-02-16" },
-  { start: "2014-10-19", end: "2015-02-22" },
-  { start: "2015-10-18", end: "2016-02-21" },
-  { start: "2016-10-16", end: "2017-02-19" },
-  { start: "2017-10-15", end: "2018-02-18" },
-  { start: "2018-11-04", end: "2019-02-17" },
-  // DST extinto após 2019
-];
+import { DateTime } from "luxon";
+import { find as findTimezone } from "geo-tz";
 
-// Estados brasileiros que NÃO observavam horário de verão (mesmo durante o período DST)
-const BRAZIL_NO_DST_STATES = ["AC", "AL", "AM", "AP", "BA", "CE", "MA", "PA", "PB", "PE", "PI", "RN", "RO", "RR", "SE", "TO"];
-// Estados que observavam: SP, RJ, MG, ES, PR, SC, RS, GO, MT, MS, DF, e mais a depender da era
-
-function isInRange(dateStr, start, end) {
-  return dateStr >= start && dateStr <= end;
-}
-
-function ymd(year, month, day) {
-  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+// ----------------------------------------------------------------------------
+// resolveIANA — descobre o nome IANA do timezone pra um lat/lon
+// ----------------------------------------------------------------------------
+// Retorna string tipo "America/Sao_Paulo", "America/Los_Angeles", "Asia/Tokyo".
+// geo-tz pode retornar múltiplos timezones em fronteiras; pegamos o primeiro
+// (o mais relevante populacionalmente).
+// ----------------------------------------------------------------------------
+export function resolveIANA(latitude, longitude) {
+  if (typeof latitude !== "number" || typeof longitude !== "number") {
+    throw new Error(`resolveIANA: lat/lon devem ser números (recebido: ${latitude}, ${longitude})`);
+  }
+  const zones = findTimezone(latitude, longitude);
+  if (!zones || zones.length === 0) {
+    throw new Error(`Não foi possível resolver timezone para ${latitude}, ${longitude}`);
+  }
+  return zones[0];
 }
 
 // ----------------------------------------------------------------------------
-// Resolver offset para data/local específicos
-// ----------------------------------------------------------------------------
-// Parâmetros:
-//   year, month (1-12), day (1-31): data local
-//   country: código ISO ("BR", "US", "AR", ...) ou null
-//   state: sigla do estado (opcional, relevante pro Brasil)
-//
-// Retorna: offset em horas em relação a UTC (ex: -3 pra BRT, -2 pra BRST)
-// ----------------------------------------------------------------------------
-export function resolveTimezoneOffset(year, month, day, country = null, state = null) {
-  const dateStr = ymd(year, month, day);
-
-  if (country === "BR") {
-    // Base: UTC-3 (horário de Brasília)
-    // Verifica se está em período DST e o estado observava
-    const observesDST = !state || !BRAZIL_NO_DST_STATES.includes(state);
-    if (observesDST) {
-      for (const period of BRAZIL_DST) {
-        if (isInRange(dateStr, period.start, period.end)) {
-          return -2; // BRST
-        }
-      }
-    }
-    return -3;
-  }
-
-  if (country === "AR" || country === "UY" || country === "CL") {
-    // Argentina/Uruguai/Chile — sem DST atual, UTC-3
-    // (Chile teve regras complexas; aqui simplificamos)
-    return -3;
-  }
-
-  if (country === "US") {
-    // Implementação simplificada: DST US do segundo domingo de março ao primeiro domingo de novembro
-    // Base offsets variam por estado (Eastern -5, Central -6, Mountain -7, Pacific -8)
-    // Aqui apenas detecta se está em DST e devolve sinalização
-    const dstStart = nthWeekdayOfMonth(year, 3, 2, 0); // 2º domingo de março
-    const dstEnd = nthWeekdayOfMonth(year, 11, 1, 0);  // 1º domingo de novembro
-    const inDST = dateStr >= dstStart && dateStr < dstEnd;
-    // Retorna o ajuste DST relativo (TODO: combinar com offset base por estado)
-    return inDST ? null : null; // requer offset base separado
-  }
-
-  if (country === "PT" || country === "ES" || country === "FR" || country === "DE" || country === "IT") {
-    // Europa Central — DST do último domingo de março ao último domingo de outubro
-    const dstStart = lastWeekdayOfMonth(year, 3, 0);
-    const dstEnd = lastWeekdayOfMonth(year, 10, 0);
-    const inDST = dateStr >= dstStart && dateStr < dstEnd;
-    // Portugal: UTC base = 0 (WET) / +1 (WEST)
-    // Espanha/França/Alemanha/Itália: UTC base = +1 (CET) / +2 (CEST)
-    if (country === "PT") return inDST ? 1 : 0;
-    return inDST ? 2 : 1;
-  }
-
-  // Default: sem ajuste, requer offset explícito
-  return null;
-}
-
-// Helper: encontra o N-ésimo dia-da-semana (0=domingo) do mês
-function nthWeekdayOfMonth(year, month, n, weekday) {
-  const firstDay = new Date(Date.UTC(year, month - 1, 1)).getUTCDay();
-  const day = 1 + ((weekday - firstDay + 7) % 7) + (n - 1) * 7;
-  return ymd(year, month, day);
-}
-function lastWeekdayOfMonth(year, month, weekday) {
-  const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  const lastDow = new Date(Date.UTC(year, month - 1, lastDay)).getUTCDay();
-  const day = lastDay - ((lastDow - weekday + 7) % 7);
-  return ymd(year, month, day);
-}
-
-// ----------------------------------------------------------------------------
-// Converter data/hora locais (no fuso da pessoa) para UT (Universal Time)
+// resolveTimezoneOffset — resolve offset histórico no momento exato
 // ----------------------------------------------------------------------------
 // Inputs:
-//   year, month, day, hour, minute: data/hora local
-//   offset: hours from UTC (e.g. -3 para Brasília sem DST, -2 com DST)
-// Retorna: { year, month, day, hour, minute } em UT
+//   year, month (1-12), day (1-31): data local
+//   hour, minute: hora local
+//   latitude, longitude: coordenadas (graus)
+//   ianaOverride: (opcional) força um nome IANA específico
+//
+// Retorna:
+//   {
+//     offsetHours: -8,             // offset em horas (negativo = oeste de UTC)
+//     ianaName: "America/Los_Angeles",
+//     isDST: false,                // se está em horário de verão
+//     offsetName: "PST",           // nome curto (ex: "PST", "BRT", "CEST")
+//   }
 // ----------------------------------------------------------------------------
-export function localToUT(year, month, day, hour, minute, offset) {
+export function resolveTimezoneOffset(year, month, day, hour, minute, latitude, longitude, ianaOverride = null) {
+  const iana = ianaOverride || resolveIANA(latitude, longitude);
+
+  // Cria um DateTime no fuso resolvido
+  const dt = DateTime.fromObject(
+    { year, month, day, hour, minute },
+    { zone: iana }
+  );
+
+  if (!dt.isValid) {
+    throw new Error(`Data inválida em ${iana}: ${dt.invalidReason} — ${dt.invalidExplanation}`);
+  }
+
+  return {
+    offsetHours: dt.offset / 60,  // luxon dá em minutos; convertemos pra horas
+    ianaName: iana,
+    isDST: dt.isInDST,
+    offsetName: dt.offsetNameShort,
+  };
+}
+
+// ----------------------------------------------------------------------------
+// localToUT — converte data/hora locais para UT (Universal Time)
+// ----------------------------------------------------------------------------
+// Inputs:
+//   year, month, day, hour, minute: data/hora locais
+//   latitude, longitude: coordenadas do local
+//   ianaOverride: (opcional) força um nome IANA específico
+//
+// Retorna:
+//   {
+//     year, month, day, hour, minute,  // todos em UT
+//     offsetUsed,                       // offset que foi usado pra conversão
+//     ianaName,                         // nome do timezone usado
+//   }
+// ----------------------------------------------------------------------------
+export function localToUT(year, month, day, hour, minute, latitude, longitude, ianaOverride = null) {
+  const iana = ianaOverride || resolveIANA(latitude, longitude);
+
+  // Cria um DateTime no fuso local correto
+  const localDT = DateTime.fromObject(
+    { year, month, day, hour, minute },
+    { zone: iana }
+  );
+
+  if (!localDT.isValid) {
+    throw new Error(`Data inválida em ${iana}: ${localDT.invalidReason}`);
+  }
+
+  // Converte pra UTC
+  const utcDT = localDT.toUTC();
+
+  return {
+    year: utcDT.year,
+    month: utcDT.month,
+    day: utcDT.day,
+    hour: utcDT.hour,
+    minute: utcDT.minute,
+    offsetUsed: localDT.offset / 60,
+    ianaName: iana,
+    isDST: localDT.isInDST,
+  };
+}
+
+// ----------------------------------------------------------------------------
+// localToUTWithOffset — variante quando o offset é passado explicitamente
+// ----------------------------------------------------------------------------
+// Útil pra retro-compatibilidade ou casos onde o usuário fornece TZ manual.
+// ----------------------------------------------------------------------------
+export function localToUTWithOffset(year, month, day, hour, minute, offsetHours) {
   // Subtrair offset converte local pra UT (se offset = -3, UT = local - (-3) = local + 3)
-  let h = hour - offset;
+  let h = hour - offsetHours;
   let m = minute;
   let d = day, mo = month, y = year;
 
@@ -163,7 +133,6 @@ export function localToUT(year, month, day, hour, minute, offset) {
   while (h < 0) { h += 24; d -= 1; }
   while (h >= 24) { h -= 24; d += 1; }
 
-  // Ajustar mês/ano se preciso
   while (d < 1) {
     mo -= 1;
     if (mo < 1) { mo = 12; y -= 1; }

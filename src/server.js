@@ -1,5 +1,5 @@
 // ============================================================================
-// THE ORB ENGINE — server.js
+// THE ORB ENGINE — server.js (v0.3)
 // ----------------------------------------------------------------------------
 // Servidor HTTP minimalista expondo endpoints REST:
 //
@@ -7,33 +7,23 @@
 //   POST /synastry    → calcula sinastria entre dois mapas
 //   POST /transits    → calcula trânsitos pra uma data
 //   GET  /geocode?q=  → autocomplete de cidade via Nominatim
+//   GET  /timezone    → debug: resolve timezone pra lat/lon/data
 //   GET  /health      → status do servidor
-//
-// Implementação usa apenas `node:http` nativo, sem Express.
-// Em produção, recomenda-se usar Express ou Fastify pra middleware/CORS/etc.
-//
-// Uso:
-//   node src/server.js [port]
-//   curl -X POST http://localhost:3000/chart -H "Content-Type: application/json" \
-//        -d '{"year":2002,"month":6,"day":25,"hour":15,"minute":45,...}'
 // ============================================================================
 
 import { createServer } from "node:http";
 import { computeNatalChart } from "./chart.js";
 import { computeSynastry, computeTransits } from "./synastry.js";
+import { resolveIANA, resolveTimezoneOffset } from "./timezone.js";
 
-// PORT: prioriza variável de ambiente (Railway, Fly.io, Render etc),
-// depois argumento de linha de comando, depois 3000 como default local.
 const PORT = Number.parseInt(process.env.PORT || process.argv[2] || "3000", 10);
 
-// CORS headers — permite chamadas de qualquer origem (em produção, restringir)
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// Helper: ler body de POST como JSON
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -49,7 +39,6 @@ function readJsonBody(req) {
   });
 }
 
-// Helper: enviar resposta JSON
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
@@ -59,12 +48,10 @@ function sendJson(res, status, payload) {
   res.end(body);
 }
 
-// Helper: enviar erro
 function sendError(res, status, message) {
   sendJson(res, status, { error: message });
 }
 
-// Helper: parse de query string
 function parseQuery(url) {
   const qIdx = url.indexOf("?");
   if (qIdx === -1) return {};
@@ -130,11 +117,38 @@ async function handleGeocode(req, res) {
   }
 }
 
+// Debug endpoint: resolve timezone for given lat/lon/date
+function handleTimezone(req, res) {
+  const params = parseQuery(req.url);
+  const lat = parseFloat(params.lat);
+  const lon = parseFloat(params.lon);
+  const year = parseInt(params.year) || new Date().getFullYear();
+  const month = parseInt(params.month) || 1;
+  const day = parseInt(params.day) || 1;
+  const hour = parseInt(params.hour) || 12;
+  const minute = parseInt(params.minute) || 0;
+
+  if (isNaN(lat) || isNaN(lon)) {
+    return sendError(res, 400, "Required: lat, lon (numbers)");
+  }
+  try {
+    const tz = resolveTimezoneOffset(year, month, day, hour, minute, lat, lon);
+    sendJson(res, 200, {
+      latitude: lat, longitude: lon,
+      date: { year, month, day, hour, minute },
+      timezone: tz,
+    });
+  } catch (e) {
+    sendError(res, 500, e.message);
+  }
+}
+
 function handleHealth(req, res) {
   sendJson(res, 200, {
     status: "ok",
     engine: "the-orb",
-    version: "0.2.0",
+    version: "0.3.0",
+    features: ["global-timezone", "iana-lookup", "luxon-dst"],
     timestamp: new Date().toISOString(),
   });
 }
@@ -152,7 +166,7 @@ async function geocodeNominatim(query, limit = 5) {
 
   const response = await fetch(url, {
     headers: {
-      "User-Agent": "TheOrbEngine/0.2 (https://github.com/amanda/the-orb)",
+      "User-Agent": "TheOrbEngine/0.3 (https://github.com/amanda/the-orb)",
       "Accept": "application/json",
     },
   });
@@ -162,37 +176,29 @@ async function geocodeNominatim(query, limit = 5) {
   }
 
   const data = await response.json();
-  return data.map(item => ({
-    name: item.display_name,
-    city: item.address?.city || item.address?.town || item.address?.village || item.address?.municipality,
-    state: item.address?.state,
-    stateCode: stateAbbreviation(item.address?.state, item.address?.country_code),
-    country: item.address?.country,
-    countryCode: (item.address?.country_code || "").toUpperCase(),
-    latitude: Number.parseFloat(item.lat),
-    longitude: Number.parseFloat(item.lon),
-    type: item.type,
-    importance: item.importance,
-  }));
-}
-
-function stateAbbreviation(stateName, countryCode) {
-  if (!stateName || !countryCode) return null;
-  if (countryCode.toLowerCase() === "br") {
-    const map = {
-      "Acre": "AC", "Alagoas": "AL", "Amapá": "AP", "Amazonas": "AM",
-      "Bahia": "BA", "Ceará": "CE", "Distrito Federal": "DF",
-      "Espírito Santo": "ES", "Goiás": "GO", "Maranhão": "MA",
-      "Mato Grosso": "MT", "Mato Grosso do Sul": "MS", "Minas Gerais": "MG",
-      "Pará": "PA", "Paraíba": "PB", "Paraná": "PR", "Pernambuco": "PE",
-      "Piauí": "PI", "Rio de Janeiro": "RJ", "Rio Grande do Norte": "RN",
-      "Rio Grande do Sul": "RS", "Rondônia": "RO", "Roraima": "RR",
-      "Santa Catarina": "SC", "São Paulo": "SP", "Sergipe": "SE",
-      "Tocantins": "TO",
+  return data.map(item => {
+    const lat = Number.parseFloat(item.lat);
+    const lon = Number.parseFloat(item.lon);
+    // Resolve IANA timezone right here so the client can show it
+    let iana = null;
+    try {
+      iana = resolveIANA(lat, lon);
+    } catch (e) {
+      iana = null;
+    }
+    return {
+      name: item.display_name,
+      city: item.address?.city || item.address?.town || item.address?.village || item.address?.municipality,
+      state: item.address?.state,
+      country: item.address?.country,
+      countryCode: (item.address?.country_code || "").toUpperCase(),
+      latitude: lat,
+      longitude: lon,
+      iana,                       // 🆕 timezone IANA resolvido aqui
+      type: item.type,
+      importance: item.importance,
     };
-    return map[stateName] || null;
-  }
-  return null;
+  });
 }
 
 // ----------------------------------------------------------------------------
@@ -215,6 +221,7 @@ const server = createServer(async (req, res) => {
     if (route === "POST /synastry") return await handleSynastry(req, res);
     if (route === "POST /transits") return await handleTransits(req, res);
     if (route === "GET /geocode") return await handleGeocode(req, res);
+    if (route === "GET /timezone") return handleTimezone(req, res);
 
     sendError(res, 404, `No route: ${route}`);
   } catch (e) {
@@ -223,14 +230,14 @@ const server = createServer(async (req, res) => {
   }
 });
 
-// IMPORTANTE: bind em 0.0.0.0 (não localhost) pra funcionar em containers de deploy
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🜨  THE ORB engine running on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`\n🜨  THE ORB engine v0.3 running on port ${PORT}`);
   console.log(`\nEndpoints:`);
   console.log(`  GET  /health`);
   console.log(`  POST /chart        → mapa natal`);
   console.log(`  POST /synastry     → sinastria`);
   console.log(`  POST /transits     → trânsitos`);
-  console.log(`  GET  /geocode?q=   → busca de cidade`);
+  console.log(`  GET  /geocode?q=   → busca de cidade (com IANA timezone)`);
+  console.log(`  GET  /timezone     → resolve timezone pra lat/lon/data`);
   console.log("");
 });

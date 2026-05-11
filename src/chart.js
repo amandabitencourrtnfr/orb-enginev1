@@ -1,11 +1,11 @@
 // ============================================================================
-// THE ORB ENGINE — chart.js
+// THE ORB ENGINE — chart.js (v0.3)
 // ----------------------------------------------------------------------------
 // API principal de cálculo de mapa natal. Unifica:
-//   - timezone (resolução automática de DST histórico)
+//   - timezone (resolução via Luxon + geo-tz, cobertura global)
 //   - astronomy (posições planetárias)
 //   - houses (casas Placidus)
-//   - aspects (próxima fase)
+//   - aspects
 // ============================================================================
 
 import {
@@ -24,7 +24,7 @@ import {
   norm360,
 } from "./astronomy.js";
 import { placidusHouses, ascendant, midheaven, houseOf } from "./houses.js";
-import { resolveTimezoneOffset, localToUT } from "./timezone.js";
+import { localToUT, localToUTWithOffset, resolveIANA } from "./timezone.js";
 
 const SIGNS = [
   "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
@@ -69,70 +69,68 @@ export function describeLongitude(lon) {
 // Input:
 //   {
 //     year, month, day,           // data local de nascimento
-//     hour, minute,               // hora local (opcional; default 12:00 — meio-dia)
-//     latitude, longitude,        // coordenadas do local de nascimento (graus, leste/norte positivos)
-//     country: "BR",              // código ISO do país (pra resolver DST)
-//     state: "PR",                // sigla do estado (pra Brasil; afeta DST regional)
-//     timezone: -3,               // (opcional) override manual; se passado, ignora detecção automática
-//     unknownTime: false,         // se true, usa 12:00 e marca isso no output
+//     hour, minute,               // hora local (opcional; default 12:00)
+//     latitude, longitude,        // coordenadas (graus) — obrigatórios
+//
+//     // Opcionais (em ordem de prioridade pra resolver timezone):
+//     timezone: -3,               // override manual, em horas (se passado, usa este)
+//     iana: "America/Sao_Paulo",  // override do nome IANA do timezone
+//
+//     // Legado (ignorados na v0.3, mantidos pra retrocompatibilidade):
+//     country: "BR",
+//     state: "PR",
+//
+//     unknownTime: false,
 //   }
 //
-// Output:
-//   {
-//     input: { ... },             // echo do input com timezone resolvido
-//     timing: { julianDay, T, LST, GAST, eps, ut: {...} },
-//     points: {                   // longitude eclíptica + descrição de cada ponto
-//       sun: { longitude, sign, degInSign, ..., house, retrograde },
-//       moon: { ... },
-//       ...
-//     },
-//     houses: {                   // 12 cúspides Placidus + ASC + MC
-//       system: "Placidus",
-//       cusps: [null, h1, h2, ..., h12],
-//       asc: { ... },
-//       mc: { ... },
-//       ic: { ... },
-//       dsc: { ... },
-//     },
-//   }
+// Resolução de timezone (em ordem):
+//   1. Se `timezone` (offset numérico) for passado, usa direto
+//   2. Se `iana` for passado, usa Luxon com esse IANA + lat/lon ignorados
+//   3. Caso contrário, resolve via geo-tz a partir de lat/lon
 // ----------------------------------------------------------------------------
 export function computeNatalChart(input) {
-  // 1. Resolver timezone
-  let offset = input.timezone;
-  if (offset === undefined || offset === null) {
-    const auto = resolveTimezoneOffset(
-      input.year, input.month, input.day,
-      input.country, input.state
-    );
-    if (auto === null) {
-      throw new Error(`Não foi possível resolver timezone automaticamente para ${input.country}/${input.state}. Passe timezone explícito.`);
-    }
-    offset = auto;
+  // Validação básica
+  if (typeof input.latitude !== "number" || typeof input.longitude !== "number") {
+    throw new Error("latitude e longitude são obrigatórios (números)");
   }
 
-  // 2. Resolver hora desconhecida
+  // 1. Resolver hora desconhecida
   let hour = input.hour, minute = input.minute;
   let unknownTime = !!input.unknownTime;
   if (hour === undefined || hour === null) {
     hour = 12; minute = 0; unknownTime = true;
   }
+  if (minute === undefined || minute === null) minute = 0;
 
-  // 3. Converter pra UT
-  const ut = localToUT(input.year, input.month, input.day, hour, minute, offset);
+  // 2. Resolver timezone e converter pra UT
+  let ut;
+  let resolvedOffset;
+  let resolvedIana = null;
 
-  // 4. Julian Day
+  if (input.timezone !== undefined && input.timezone !== null) {
+    // Override manual — usa offset numérico direto
+    resolvedOffset = input.timezone;
+    ut = localToUTWithOffset(input.year, input.month, input.day, hour, minute, resolvedOffset);
+  } else {
+    // Resolver via geo-tz (com possível override de IANA)
+    const result = localToUT(input.year, input.month, input.day, hour, minute, input.latitude, input.longitude, input.iana || null);
+    ut = { year: result.year, month: result.month, day: result.day, hour: result.hour, minute: result.minute };
+    resolvedOffset = result.offsetUsed;
+    resolvedIana = result.ianaName;
+  }
+
+  // 3. Julian Day
   const JD = julianDay(ut.year, ut.month, ut.day, ut.hour, ut.minute, 0);
   const T = julianCenturies(JD);
   const eps = trueObliquity(T);
   const GAST = greenwichApparentSiderealTime(JD);
   const LST = localSiderealTime(JD, input.longitude);
 
-  // 5. Casas (se hora conhecida)
+  // 4. Casas (se hora conhecida)
   let houses;
   if (!unknownTime) {
     houses = placidusHouses(LST, input.latitude, eps);
   } else {
-    // Sem hora: ainda calculamos longitudes planetárias, mas casas são indefinidas.
     houses = {
       cusps: new Array(13).fill(null),
       system: "Unknown (no birth time)",
@@ -141,7 +139,7 @@ export function computeNatalChart(input) {
     };
   }
 
-  // 6. Posições planetárias
+  // 5. Posições planetárias
   const points = {};
   const rawLongitudes = {
     sun: sunGeocentric(JD).longitude,
@@ -159,8 +157,7 @@ export function computeNatalChart(input) {
     chiron: chironLongitude(JD),
   };
 
-  // Determinar retrogradação: comparar longitude em JD e JD+1
-  const dtRetro = 1.0; // dias
+  const dtRetro = 1.0;
   const futureLongitudes = {
     sun: sunGeocentric(JD + dtRetro).longitude,
     moon: moonGeocentric(JD + dtRetro).longitude,
@@ -180,7 +177,6 @@ export function computeNatalChart(input) {
   for (const p of PLANETS) {
     const lon = rawLongitudes[p];
     const lonFuture = futureLongitudes[p];
-    // Movimento diário (em graus, com sinal); se negativo, retrógrado
     let speed = lonFuture - lon;
     if (speed > 180) speed -= 360;
     if (speed < -180) speed += 360;
@@ -210,7 +206,8 @@ export function computeNatalChart(input) {
   return {
     input: {
       ...input,
-      timezone: offset,
+      timezone: resolvedOffset,
+      iana: resolvedIana,
       unknownTime,
     },
     timing: {
@@ -219,6 +216,10 @@ export function computeNatalChart(input) {
       obliquity: eps,
       siderealTime: { gast: GAST, lst: LST },
       ut: { ...ut },
+      timezone: {
+        offsetHours: resolvedOffset,
+        iana: resolvedIana,
+      },
     },
     points,
     houses,
