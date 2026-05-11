@@ -126,6 +126,29 @@ export function trueObliquity(T) {
 }
 
 // ----------------------------------------------------------------------------
+// PRECESSÃO EM LONGITUDE ECLÍPTICA (J2000 → equinócio da data)
+// ----------------------------------------------------------------------------
+// Os termos VSOP87 implementados neste arquivo dão coordenadas no equinócio
+// J2000 (fixo). Astrologia usa coordenadas no equinócio da data (que se move
+// com a precessão dos equinócios).
+//
+// Esta função retorna o deslocamento em GRAUS a ser ADICIONADO à longitude
+// calculada em J2000 pra obter a longitude no equinócio da data.
+//
+// Fórmula: Lieske et al. 1977 / Meeus capítulo 21.
+//   p_A = 5028.796195'' × T + 1.1054348'' × T² + ...  (em segundos de arco)
+//   onde T = séculos julianos desde J2000.
+//
+// Pra T positivo (depois de 2000), p_A é positivo → soma à longitude.
+// Pra T negativo (antes de 2000), p_A é negativo → equivale a subtrair.
+// ----------------------------------------------------------------------------
+export function precessionFromJ2000(T) {
+  // Termos em segundos de arco; retorna em graus
+  const p_A_arcsec = 5028.796195 * T + 1.1054348 * T * T;
+  return p_A_arcsec / 3600;
+}
+
+// ----------------------------------------------------------------------------
 // TEMPO SIDERAL APARENTE EM GREENWICH (GAST), em graus
 // ----------------------------------------------------------------------------
 export function greenwichApparentSiderealTime(JD) {
@@ -585,6 +608,10 @@ export function planetGeocentric(planet, JD) {
   const d2 = Math.sqrt(x2 * x2 + y2 * y2 + z2 * z2);
   longitude = norm360(Math.atan2(y2, x2) * RAD);
 
+  // Aplicar precessão J2000 → equinócio da data
+  // (VSOP87 retorna em J2000; astrologia usa equinócio da data)
+  longitude = norm360(longitude + precessionFromJ2000(T));
+
   // Aplicar nutação em longitude
   const { deltaPsi } = nutation(T);
   longitude = norm360(longitude + deltaPsi);
@@ -605,6 +632,8 @@ export function sunGeocentric(JD) {
   // Sol está exatamente oposto à posição heliocêntrica da Terra
   let longitude = norm360(helE.L + 180);
   const latitude = -helE.B; // pequena correção
+  // Precessão J2000 → equinócio da data
+  longitude = norm360(longitude + precessionFromJ2000(T));
   // Nutação
   const { deltaPsi } = nutation(T);
   longitude = norm360(longitude + deltaPsi);
@@ -990,6 +1019,9 @@ export function plutoGeocentric(JD) {
   const x2 = xHel2 - xe, y2 = yHel2 - ye, z2 = zHel2 - ze;
   longitude = norm360(Math.atan2(y2, x2) * RAD);
 
+  // Precessão J2000 → equinócio da data
+  longitude = norm360(longitude + precessionFromJ2000(T));
+
   // Nutação
   const { deltaPsi } = nutation(T);
   longitude = norm360(longitude + deltaPsi);
@@ -1065,6 +1097,8 @@ export function chironLongitude(JD) {
   const z = zHel - ze;
 
   let longitude = norm360(Math.atan2(y, x) * RAD);
+  // Precessão J2000 → equinócio da data
+  longitude = norm360(longitude + precessionFromJ2000(T));
   const { deltaPsi } = nutation(T);
   longitude = norm360(longitude + deltaPsi);
   return longitude;
